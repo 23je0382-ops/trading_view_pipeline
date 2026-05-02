@@ -31,39 +31,122 @@ def init_db():
         
     try:
         with conn.cursor() as cur:
-            # Create the table if it doesn't exist (with the new columns)
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS trading_alerts (
-                    id SERIAL PRIMARY KEY,
-                    ticker VARCHAR(50) NOT NULL,
-                    time VARCHAR(50),
-                    open NUMERIC,
-                    high NUMERIC,
-                    low NUMERIC,
-                    close NUMERIC,
-                    volume NUMERIC,
-                    interval VARCHAR(50),
-                    exchange VARCHAR(50),
-                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Safely add the new columns to your existing table in case it was created earlier
-            try:
-                cur.execute('ALTER TABLE trading_alerts ADD COLUMN IF NOT EXISTS interval VARCHAR(50);')
-                cur.execute('ALTER TABLE trading_alerts ADD COLUMN IF NOT EXISTS exchange VARCHAR(50);')
-            except Exception as e:
-                print(f"Note: Column alter skipped: {e}")
+            # Create the tables if they don't exist
+            tables = ['trading_alerts', 'alerts_15m', 'alerts_30m']
+            for table in tables:
+                cur.execute(f'''
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id SERIAL PRIMARY KEY,
+                        ticker VARCHAR(50) NOT NULL,
+                        time VARCHAR(50),
+                        open NUMERIC,
+                        high NUMERIC,
+                        low NUMERIC,
+                        close NUMERIC,
+                        volume NUMERIC,
+                        interval VARCHAR(50),
+                        exchange VARCHAR(50),
+                        is_aggregated BOOLEAN DEFAULT FALSE,
+                        received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Safely add the new columns to existing tables
+                columns = [
+                    ('interval', 'VARCHAR(50)'),
+                    ('exchange', 'VARCHAR(50)'),
+                    ('is_aggregated', 'BOOLEAN DEFAULT FALSE')
+                ]
+                for col_name, col_type in columns:
+                    try:
+                        cur.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type};')
+                    except Exception:
+                        pass
 
         conn.commit()
-        print("Connected to PostgreSQL and verified table exists!")
+        print("Connected to PostgreSQL and verified tables exist!")
     except Exception as e:
         print(f"Error initializing database table: {e}")
     finally:
         conn.close()
 
-# Initialize the database table when the app starts
+# Initialize the database tables when the app starts
 init_db()
+
+def aggregate_ohlcv(rows, target_interval):
+    if not rows:
+        return None
+    
+    # Sort rows by time or ID to ensure correct open/close
+    sorted_rows = sorted(rows, key=lambda x: x['id'])
+    
+    return {
+        'ticker': sorted_rows[0]['ticker'],
+        'time': sorted_rows[-1]['time'], # Use the time of the last candle in the period
+        'open': sorted_rows[0]['open'],
+        'high': max(row['high'] for row in sorted_rows),
+        'low': min(row['low'] for row in sorted_rows),
+        'close': sorted_rows[-1]['close'],
+        'volume': sum(row['volume'] for row in sorted_rows),
+        'interval': target_interval,
+        'exchange': sorted_rows[0]['exchange']
+    }
+
+def check_and_aggregate(source_table, target_table, count_required, target_interval):
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get symbols that have un-aggregated rows
+            cur.execute(f"SELECT DISTINCT ticker FROM {source_table} WHERE is_aggregated = FALSE")
+            tickers = [row['ticker'] for row in cur.fetchall()]
+            
+            for ticker in tickers:
+                # Fetch the un-aggregated rows for this ticker
+                cur.execute(f'''
+                    SELECT * FROM {source_table} 
+                    WHERE ticker = %s AND is_aggregated = FALSE 
+                    ORDER BY id ASC 
+                    LIMIT %s
+                ''', (ticker, count_required))
+                
+                rows = cur.fetchall()
+                
+                if len(rows) == count_required:
+                    # Perform aggregation
+                    aggregated_data = aggregate_ohlcv(rows, target_interval)
+                    
+                    # Insert into target table
+                    cur.execute(f'''
+                        INSERT INTO {target_table} (ticker, time, open, high, low, close, volume, interval, exchange)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                    ''', (
+                        aggregated_data['ticker'], aggregated_data['time'], 
+                        aggregated_data['open'], aggregated_data['high'], 
+                        aggregated_data['low'], aggregated_data['close'], 
+                        aggregated_data['volume'], aggregated_data['interval'], 
+                        aggregated_data['exchange']
+                    ))
+                    
+                    # Mark source rows as aggregated
+                    row_ids = [row['id'] for row in rows]
+                    cur.execute(f"UPDATE {source_table} SET is_aggregated = TRUE WHERE id = ANY(%s)", (row_ids,))
+                    
+                    print(f"Aggregated {count_required} rows from {source_table} into {target_table} for {ticker}")
+                    
+                    # If we aggregated into 15m, trigger 30m check
+                    if target_table == 'alerts_15m':
+                        check_and_aggregate('alerts_15m', 'alerts_30m', 2, '30')
+        
+        conn.commit()
+    except Exception as e:
+        print(f"Error during aggregation: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 def write_to_postgres(data):
     conn = get_db_connection()
@@ -74,11 +157,11 @@ def write_to_postgres(data):
         with conn.cursor() as cur:
             cur.execute(
                 '''
-                INSERT INTO trading_alerts (ticker, time, open, high, low, close, volume, interval, exchange, received_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO trading_alerts (ticker, time, open, high, low, close, volume, interval, exchange)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''',
                 (
-                    data.get('symbol', data.get('ticker', 'UNKNOWN')), # Handles both your old 'ticker' and new 'symbol'
+                    data.get('symbol', data.get('ticker', 'UNKNOWN')),
                     data.get('time', ''),
                     data.get('open', None),
                     data.get('high', None),
@@ -86,11 +169,14 @@ def write_to_postgres(data):
                     data.get('close', None),
                     data.get('volume', None),
                     data.get('interval', None),
-                    data.get('exchange', None),
-                    datetime.utcnow()
+                    data.get('exchange', None)
                 )
             )
         conn.commit()
+        
+        # Trigger aggregation chain
+        check_and_aggregate('trading_alerts', 'alerts_15m', 3, '15')
+        
     except Exception as e:
         conn.rollback()
         raise e
@@ -120,7 +206,7 @@ def webhook():
             # Write to PostgreSQL
             write_to_postgres(data)
             
-            return jsonify({"status": "success", "message": "Data saved to PostgreSQL"}), 200
+            return jsonify({"status": "success", "message": "Data saved and aggregated"}), 200
             
         except Exception as e:
             print(f"Error processing webhook: {str(e)}")
