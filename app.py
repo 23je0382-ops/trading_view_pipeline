@@ -31,7 +31,7 @@ def init_db():
         
     try:
         with conn.cursor() as cur:
-            # Create the table if it doesn't exist
+            # Create the table if it doesn't exist (with the new columns)
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS trading_alerts (
                     id SERIAL PRIMARY KEY,
@@ -42,9 +42,19 @@ def init_db():
                     low NUMERIC,
                     close NUMERIC,
                     volume NUMERIC,
+                    interval VARCHAR(50),
+                    exchange VARCHAR(50),
                     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Safely add the new columns to your existing table in case it was created earlier
+            try:
+                cur.execute('ALTER TABLE trading_alerts ADD COLUMN IF NOT EXISTS interval VARCHAR(50);')
+                cur.execute('ALTER TABLE trading_alerts ADD COLUMN IF NOT EXISTS exchange VARCHAR(50);')
+            except Exception as e:
+                print(f"Note: Column alter skipped: {e}")
+
         conn.commit()
         print("Connected to PostgreSQL and verified table exists!")
     except Exception as e:
@@ -64,17 +74,19 @@ def write_to_postgres(data):
         with conn.cursor() as cur:
             cur.execute(
                 '''
-                INSERT INTO trading_alerts (ticker, time, open, high, low, close, volume, received_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO trading_alerts (ticker, time, open, high, low, close, volume, interval, exchange, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''',
                 (
-                    data.get('ticker', 'UNKNOWN'),
+                    data.get('symbol', data.get('ticker', 'UNKNOWN')), # Handles both your old 'ticker' and new 'symbol'
                     data.get('time', ''),
                     data.get('open', None),
                     data.get('high', None),
                     data.get('low', None),
                     data.get('close', None),
                     data.get('volume', None),
+                    data.get('interval', None),
+                    data.get('exchange', None),
                     datetime.utcnow()
                 )
             )
@@ -91,6 +103,14 @@ def webhook():
         try:
             # Parse the incoming JSON data from TradingView
             data = request.json
+            
+            # Sometimes TradingView sends the JSON as a string, let's handle that safely
+            import json
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    pass
             
             if not data:
                 return jsonify({"error": "No JSON data received"}), 400
