@@ -4,6 +4,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from datetime import datetime
+import json
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -70,9 +71,6 @@ def init_db():
     finally:
         conn.close()
 
-# Initialize the database tables when the app starts
-init_db()
-
 def aggregate_ohlcv(rows, target_interval):
     if not rows:
         return None
@@ -82,7 +80,7 @@ def aggregate_ohlcv(rows, target_interval):
     
     return {
         'ticker': sorted_rows[0]['ticker'],
-        'time': sorted_rows[-1]['time'], # Use the time of the last candle in the period
+        'time': sorted_rows[-1]['time'],
         'open': sorted_rows[0]['open'],
         'high': max(row['high'] for row in sorted_rows),
         'low': min(row['low'] for row in sorted_rows),
@@ -95,9 +93,10 @@ def aggregate_ohlcv(rows, target_interval):
 def check_and_aggregate(source_table, target_table, count_required, target_interval):
     conn = get_db_connection()
     if not conn:
-        return
+        return False
     
     try:
+        aggregated_any = False
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Get symbols that have un-aggregated rows
             cur.execute(f"SELECT DISTINCT ticker FROM {source_table} WHERE is_aggregated = FALSE")
@@ -122,7 +121,6 @@ def check_and_aggregate(source_table, target_table, count_required, target_inter
                     cur.execute(f'''
                         INSERT INTO {target_table} (ticker, time, open, high, low, close, volume, interval, exchange)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
                     ''', (
                         aggregated_data['ticker'], aggregated_data['time'], 
                         aggregated_data['open'], aggregated_data['high'], 
@@ -136,17 +134,34 @@ def check_and_aggregate(source_table, target_table, count_required, target_inter
                     cur.execute(f"UPDATE {source_table} SET is_aggregated = TRUE WHERE id = ANY(%s)", (row_ids,))
                     
                     print(f"Aggregated {count_required} rows from {source_table} into {target_table} for {ticker}")
+                    aggregated_any = True
                     
-                    # If we aggregated into 15m, trigger 30m check
+                    # If we aggregated into 15m, trigger 30m check immediately
                     if target_table == 'alerts_15m':
                         check_and_aggregate('alerts_15m', 'alerts_30m', 2, '30')
         
         conn.commit()
+        return aggregated_any
     except Exception as e:
         print(f"Error during aggregation: {e}")
         conn.rollback()
+        return False
     finally:
         conn.close()
+
+def backfill_on_startup():
+    print("Starting automatic backfill...")
+    # Loop 5m -> 15m until no more can be aggregated
+    while check_and_aggregate('trading_alerts', 'alerts_15m', 3, '15'):
+        pass
+    # Loop 15m -> 30m until no more can be aggregated
+    while check_and_aggregate('alerts_15m', 'alerts_30m', 2, '30'):
+        pass
+    print("Backfill completed!")
+
+# Initialize and backfill when the app starts
+init_db()
+backfill_on_startup()
 
 def write_to_postgres(data):
     conn = get_db_connection()
@@ -187,11 +202,7 @@ def write_to_postgres(data):
 def webhook():
     if request.method == 'POST':
         try:
-            # Parse the incoming JSON data from TradingView
             data = request.json
-            
-            # Sometimes TradingView sends the JSON as a string, let's handle that safely
-            import json
             if isinstance(data, str):
                 try:
                     data = json.loads(data)
@@ -202,8 +213,6 @@ def webhook():
                 return jsonify({"error": "No JSON data received"}), 400
                 
             print(f"Received alert: {data}")
-            
-            # Write to PostgreSQL
             write_to_postgres(data)
             
             return jsonify({"status": "success", "message": "Data saved and aggregated"}), 200
